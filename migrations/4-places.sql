@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS places (
     id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL,
     name TEXT NOT NULL,
     category TEXT NOT NULL,
     subcategory TEXT NOT NULL,
@@ -7,7 +8,7 @@ CREATE TABLE IF NOT EXISTS places (
     updated_at TEXT DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW')),
     updated_by INTEGER NOT NULL,
     
-    UNIQUE(name, category, subcategory)
+    UNIQUE(key)
     FOREIGN KEY (updated_by) REFERENCES jobs (id)
         ON UPDATE RESTRICT
         ON DELETE RESTRICT
