@@ -29,50 +29,32 @@ def job_init(cur):
     return cur.lastrowid
 
 
-def upsert_wallets(cur, df):
-    df.to_sql('wallets_staging', cur.connection, if_exists='replace')
-    
-    return '''
-        INSERT INTO wallets (key, name, currency, category, updated_by)
-        
-        SELECT
-            ws.key, ws.name, ws.currency, ws.`group` as category, ? as updated_by
-        FROM
-            wallets_staging ws
-            LEFT JOIN wallets w ON w.key = ws.key
-        WHERE
-            w.id IS NULL
-            OR ws.`group` <> w.category
-            OR ws.name <> w.name
-            OR ws.currency <> w.currency
-            
-        ON CONFLICT(key) DO UPDATE SET
-            category=excluded.category,
-            name=excluded.name,
-            currency=excluded.currency,
-            updated_by=excluded.updated_by,
-            updated_at=STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW');
-    '''
+def upsert_dim(cur, df, name, fields):
+    df.to_sql(f'{name}_staging', cur.connection, if_exists='replace')
 
-def upsert_categories(cur, df):
-    df.to_sql('categories_staging', cur.connection, if_exists='replace')
+    insert_list, select_list, diff_list, update_list = [], [], [], []
+    for old_name, new_name in fields:
+        if new_name is None:
+            new_name = old_name
+        insert_list.append(new_name)
+        select_list.append(f'ws.`{old_name}` as {new_name}')
+        diff_list.append(f'ws.`{old_name}` <> w.`{new_name}`')
+        update_list.append(f'{new_name}=excluded.{new_name}')
     
-    return '''
-        INSERT INTO categoriess (key, name, category, updated_by)
+    return f'''
+        INSERT INTO {name} (key, {', '.join(insert_list)}, updated_by)
         
         SELECT
-            ws.key, ws.name, ws.`group` as category, ? as updated_by
+            ws.key, {', '.join(select_list)}, ? as updated_by
         FROM
-            categories_staging ws
-            LEFT JOIN categories w ON w.key = ws.key
+            {name}_staging ws
+            LEFT JOIN {name} w ON w.key = ws.key
         WHERE
             w.id IS NULL
-            OR ws.`group` <> w.category
-            OR ws.name <> w.name
+            OR {' OR '.join(diff_list)}
             
         ON CONFLICT(key) DO UPDATE SET
-            category=excluded.category,
-            name=excluded.name,
+            {', '.join(update_list)},
             updated_by=excluded.updated_by,
             updated_at=STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW');
     '''
@@ -82,11 +64,13 @@ def job_fail(cur, job_id):
     cur.execute("UPDATE jobs SET failed = ?, message = ?, updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ?", [1, traceback.format_exc(), job_id])
     sys.exit(1)
 
+
 def job_complete(cur, job_id):
     cur.execute("UPDATE jobs SET updated_at = STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') WHERE id = ?", [job_id])
     sys.exit(1)
 
-if __name__ == '__main__':
+
+def get_sheets_data():
     wallets = pd.DataFrame([
         {'key': 'Barclays - GBP', 'name': 'Barclays', 'currency': 'GBP', 'group': 'Corrente'},
     ])
@@ -95,13 +79,31 @@ if __name__ == '__main__':
         {'key': 'ALI - Bebidas (Nao Alc)', 'name': 'Bebidas (Nao Alc)', 'group': 'Alimentação'},
     ])
     
+    places = pd.DataFrame([
+        {'key': 'ALICAF - 1657 Chocolate House', 'name': '1657 Chocolate House', 'subgkey': 'Alimentação - Cafeteria', 'old.key': '1657 Chocolate House', 'subgroup': 'Cafeteria', 'group': 'Alimentação'},
+    ])
+
+    events = pd.DataFrame([
+        {'key': 'Manchester (UK) - 26/02/22', 'name': 'Manchester (UK)', 'group': 'Lazer', 'starts_at': '26/02/2022', 'ends_at': '01/03/2022'},
+    ])
+    events['starts_at'] = pd.to_datetime(events['starts_at'], format='%d/%m/%Y')
+    events['ends_at'] = pd.to_datetime(events['ends_at'], format='%d/%m/%Y')
+
+    return wallets, categories, places, events
+
+
+if __name__ == '__main__':
+    wallets, categories, places, events = get_sheets_data()
+    
     with SQLite('data/db.db') as cur:
         setup_database(cur)
         job_id = job_init(cur)
 
         try:
-            wallets_sql = upsert_wallets(cur, wallets)
-            categories_sql = upsert_categories(cur, categories)
+            wallets_sql = upsert_dim(cur, wallets, 'wallets', (('name', None), ('group', 'category'), ('currency', None)))
+            categories_sql = upsert_dim(cur, categories, 'categories', (('name', None), ('group', 'category')))
+            places_sql = upsert_dim(cur, places, 'places', (('name', None), ('group', 'category'), ('subgroup', 'subcategory')))
+            events_sql = upsert_dim(cur, events, 'events', (('name', None), ('group', 'category'), ('starts_at', None), ('ends_at', None)))
         except:
             job_fail(cur, job_id)
         
@@ -109,6 +111,8 @@ if __name__ == '__main__':
         try:
             cur.execute(wallets_sql, [job_id])
             cur.execute(categories_sql, [job_id])
+            cur.execute(places_sql, [job_id])
+            cur.execute(events_sql, [job_id])
             cur.execute("commit")
         except:
             cur.execute("rollback")
