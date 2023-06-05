@@ -70,6 +70,37 @@ def job_complete(cur, job_id):
     sys.exit(1)
 
 
+def clean_transactions(cur, month):
+    cur.execute('drop table if exists transactions_cl')
+    cur.execute(f'''
+        CREATE TABLE transactions_cl AS
+        WITH
+        clean_trs AS (
+            SELECT
+                date('2023-06-' || substr('00' || tr.day, -2, 2)) as day,
+                CAST(CAST(tr.value AS DOUBLE)*100 AS INTEGER) as value,
+                tr.description,
+                w.id AS wallet,
+                c.id AS category,
+                p.id AS place,
+                e.id as event
+            FROM
+                transactions_raw tr
+                LEFT JOIN wallets w ON w.key = tr.wallet
+                LEFT JOIN categories c ON c.key = tr.category
+                LEFT JOIN places p ON p.key = tr.place
+                LEFT JOIN events e ON e.key = tr.event
+            WHERE
+                w.id IS NOT NULL
+                AND c.id IS NOT NULL
+                AND p.id IS NOT NULL
+                AND tr.value IS NOT NULL AND tr.value <> ''
+                AND (e.id IS NOT NULL OR e.id IS NULL AND (tr.event IS NULL OR tr.event = ''))
+        )
+        SELECT * FROM clean_trs WHERE day IS NOT NULL
+    ''')
+
+
 def get_sheets_data():
     wallets = pd.DataFrame([
         {'key': 'Barclays - GBP', 'name': 'Barclays', 'currency': 'GBP', 'group': 'Corrente'},
@@ -80,7 +111,7 @@ def get_sheets_data():
     ])
     
     places = pd.DataFrame([
-        {'key': 'ALICAF - 1657 Chocolate House', 'name': '1657 Chocolate House', 'subgkey': 'Alimentação - Cafeteria', 'old.key': '1657 Chocolate House', 'subgroup': 'Cafeteria', 'group': 'Alimentação'},
+        {'key': "ALISUP - Sainsbury's", 'name': "Sainsbury's", 'subgkey': 'Alimentação - Supermercado', 'old.key': '-', 'subgroup': 'Supermercado', 'group': 'Alimentação'},
     ])
 
     events = pd.DataFrame([
@@ -89,12 +120,16 @@ def get_sheets_data():
     events['starts_at'] = pd.to_datetime(events['starts_at'], format='%d/%m/%Y')
     events['ends_at'] = pd.to_datetime(events['ends_at'], format='%d/%m/%Y')
 
-    return wallets, categories, places, events
+    transactions = pd.DataFrame([
+        {'day': 3,'value': -4.68,'description': 'Coquinha', 'wallet': 'Barclays - GBP', 'category': 'ALI - Bebidas (Nao Alc)', 'place': "ALISUP - Sainsbury's", 'event': ''},
+    ])
+
+    return wallets, categories, places, events, transactions
 
 
 if __name__ == '__main__':
-    wallets, categories, places, events = get_sheets_data()
-    
+    wallets, categories, places, events, transactions = get_sheets_data()
+
     with SQLite('data/db.db') as cur:
         setup_database(cur)
         job_id = job_init(cur)
@@ -104,6 +139,7 @@ if __name__ == '__main__':
             categories_sql = upsert_dim(cur, categories, 'categories', (('name', None), ('group', 'category')))
             places_sql = upsert_dim(cur, places, 'places', (('name', None), ('group', 'category'), ('subgroup', 'subcategory')))
             events_sql = upsert_dim(cur, events, 'events', (('name', None), ('group', 'category'), ('starts_at', None), ('ends_at', None)))
+            transactions.to_sql(f'transactions_raw', cur.connection, if_exists='replace')
         except:
             job_fail(cur, job_id)
         
@@ -113,6 +149,7 @@ if __name__ == '__main__':
             cur.execute(categories_sql, [job_id])
             cur.execute(places_sql, [job_id])
             cur.execute(events_sql, [job_id])
+            clean_transactions(cur, '2023-06')
             cur.execute("commit")
         except:
             cur.execute("rollback")
