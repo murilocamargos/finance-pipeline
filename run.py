@@ -77,8 +77,8 @@ def clean_transactions(cur, month):
         WITH
         clean_trs AS (
             SELECT
-                date('2023-06-' || substr('00' || tr.day, -2, 2)) as day,
-                CAST(CAST(tr.value AS DOUBLE)*100 AS INTEGER) as value,
+                date('{month}-' || substr('00' || tr.day, -2, 2)) as day,
+                tr.value,
                 tr.description,
                 w.id AS wallet,
                 c.id AS category,
@@ -101,34 +101,66 @@ def clean_transactions(cur, month):
     ''')
 
 
-def get_sheets_data():
-    wallets = pd.DataFrame([
-        {'key': 'Barclays - GBP', 'name': 'Barclays', 'currency': 'GBP', 'group': 'Corrente'},
-    ])
+def consolidate_transactions(cur, month, job_id):
+    conditions = 't.day = cl.day AND t.value = cl.value AND t.description = cl.description AND t.wallet = cl.wallet AND t.category = cl.category AND t.place = cl.place AND (t.event = cl.event OR (t.event IS NULL AND cl.event IS NULL))'
+    cur.execute(f'''
+        INSERT INTO transactions (day, value, description, wallet, category, place, event, created_at, created_by)
+        SELECT
+            cl.*, STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW') as created_at, ? as created_by
+        FROM
+            transactions_cl cl
+            LEFT JOIN transactions t ON ({conditions})
+        WHERE t.id IS NULL
+    ''', [job_id])
 
-    categories = pd.DataFrame([
-        {'key': 'ALI - Bebidas (Nao Alc)', 'name': 'Bebidas (Nao Alc)', 'group': 'Alimentação'},
-    ])
+    cur.execute(f'''
+        DELETE FROM transactions WHERE id IN (
+            SELECT
+                t.id
+            FROM
+                transactions t
+                LEFT JOIN transactions_cl cl ON ({conditions})
+            WHERE cl.day IS NULL AND t.day like '{month}-%'
+        )
+    ''')
+
+
+def get_sheets_data(month):
+    wallets = pd.read_csv('data/wallets.csv', na_filter=False)
+    wallets = wallets.rename(columns={'id': 'key', 'category': 'group'})
+
+    categories = pd.read_csv('data/categories.csv', na_filter=False)
+    categories = categories.rename(columns={'id': 'key', 'category': 'group'})
+
+    places = pd.read_csv('data/places.csv', na_filter=False)
+    places['group'] = places['category'].str.split(' - ').str[0]
+    places['subgroup'] = places['category'].str.split(' - ').str[1]
+    places = places.rename(columns={'id': 'key'})
+
+    events = pd.read_csv('data/events.csv', na_filter=False)
+    events['starts_at'] = pd.to_datetime(events['starts_at'])
+    events['ends_at'] = pd.to_datetime(events['ends_at'])
+    events.loc[events['starts_at'].isna(), 'starts_at'] = '2021-01-01'
+    events = events.rename(columns={'id': 'key', 'category': 'group'})
+
+    transactions = pd.read_csv('data/transactions.csv')
+    transactions.loc[transactions['description'].isna(), 'description'] = 'Comida'
+    transactions['value'] = (transactions['value']*100).round().astype(int)
+    transactions = transactions[pd.to_datetime(transactions['day']).dt.strftime('%Y-%m') == month].copy()
+
+    if transactions.shape[0] != 0:
+        wallets = wallets[wallets['key'].isin(transactions['wallet'].unique())]
+        categories = categories[categories['key'].isin(transactions['category'].unique())]
+        places = places[places['key'].isin(transactions['place'].unique())]
+        events = events[events['key'].isin(transactions['event'].unique())]
     
-    places = pd.DataFrame([
-        {'key': "ALISUP - Sainsbury's", 'name': "Sainsbury's", 'subgkey': 'Alimentação - Supermercado', 'old.key': '-', 'subgroup': 'Supermercado', 'group': 'Alimentação'},
-    ])
-
-    events = pd.DataFrame([
-        {'key': 'Manchester (UK) - 26/02/22', 'name': 'Manchester (UK)', 'group': 'Lazer', 'starts_at': '26/02/2022', 'ends_at': '01/03/2022'},
-    ])
-    events['starts_at'] = pd.to_datetime(events['starts_at'], format='%d/%m/%Y')
-    events['ends_at'] = pd.to_datetime(events['ends_at'], format='%d/%m/%Y')
-
-    transactions = pd.DataFrame([
-        {'day': 3,'value': -4.68,'description': 'Coquinha', 'wallet': 'Barclays - GBP', 'category': 'ALI - Bebidas (Nao Alc)', 'place': "ALISUP - Sainsbury's", 'event': ''},
-    ])
-
     return wallets, categories, places, events, transactions
 
 
 if __name__ == '__main__':
-    wallets, categories, places, events, transactions = get_sheets_data()
+    month = '2023-07'
+    wallets, categories, places, events, transactions = get_sheets_data(month)
+    print(month, transactions.shape[0])
 
     with SQLite('data/db.db') as cur:
         setup_database(cur)
@@ -149,7 +181,8 @@ if __name__ == '__main__':
             cur.execute(categories_sql, [job_id])
             cur.execute(places_sql, [job_id])
             cur.execute(events_sql, [job_id])
-            clean_transactions(cur, '2023-06')
+            clean_transactions(cur, month)
+            consolidate_transactions(cur, month, job_id)
             cur.execute("commit")
         except:
             cur.execute("rollback")
